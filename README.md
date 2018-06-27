@@ -73,7 +73,7 @@ the configuration is expected to be placed in /etc/foreman_dlm_updater/config.in
 
 an example configuration looks like this
 
-´´´
+```
 
 [main]
 log = /var/log/foreman_dlm_updater.log
