@@ -101,7 +101,7 @@ needs_reboot.d = /etc/foreman_dlm_updater/needs_reboot.d/
 update.d = /etc/foreman_dlm_updater/update.d/
 reboot_cmd = /usr/sbin/reboot
 
-´´´
+```
 
 
 Author
