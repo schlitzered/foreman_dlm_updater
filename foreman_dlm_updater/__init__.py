@@ -3,6 +3,7 @@ import configparser
 import subprocess
 import logging
 import os
+import stat
 import sys
 import time
 from logging.handlers import TimedRotatingFileHandler
@@ -18,9 +19,17 @@ def main():
                         default="/etc/foreman_dlm_updater/config.ini",
                         help="Full path to configuration")
 
+    parser.add_argument("--after_reboot", dest="rbt", action="store_true",
+                        default=False,
+                        help="has to be used from init systems, to indicated that the script was calle:w"
+                             "d while booting.")
+
     parsed_args = parser.parse_args()
 
-    instance = ForemanDlmUpdater(cfg=parsed_args.cfg)
+    instance = ForemanDlmUpdater(
+        cfg=parsed_args.cfg,
+        rbt=parsed_args.rbt,
+    )
     instance.work()
 
 
@@ -96,10 +105,11 @@ class ForemanDlmLock(object):
 
 
 class ForemanDlmUpdater(object):
-    def __init__(self, cfg):
+    def __init__(self, cfg, rbt):
         self._config_file = cfg
         self._config = configparser.ConfigParser()
         self._config_dict = None
+        self._rbt = rbt
         self.log = logging.getLogger('application')
         self.config.read_file(open(self._config_file))
         self._logging()
@@ -124,6 +134,10 @@ class ForemanDlmUpdater(object):
     @property
     def lock(self):
         return self._lock
+
+    @property
+    def rbt(self):
+        return self._rbt
 
     def _logging(self):
         logfmt = logging.Formatter('%(asctime)sUTC - %(levelname)s - %(threadName)s - %(message)s')
@@ -153,10 +167,11 @@ class ForemanDlmUpdater(object):
             with open(self.config.get('main', 'state'), 'r') as state:
                 return state.readline().rstrip("\n")
         except FileNotFoundError:
-            return 'check_update'
+            return 'needs_update'
 
     @task.setter
     def task(self, task):
+        self.log.info("setting task to {0}".format(task))
         try:
             with open(self.config.get('main', 'state'), 'w') as state:
                 state.write("{0}\n".format(task))
@@ -171,26 +186,13 @@ class ForemanDlmUpdater(object):
         except OSError as err:
             self.log.error("could not remove state file: {0}".format(err))
 
-    def check_update(self):
-        do_update = False
-        self.log.info("checking if updates are available")
-        _path = self.config.get('main', 'needs_update.d')
-        files = [f for f in os.listdir(_path) if os.path.isfile(os.path.join(_path, f))]
-        for _file in files:
-            _file = os.path.join(_path, _file)
-            if not os.access(_file, os.X_OK):
-                continue
-            self.log.info("running: {0}".format(_file))
-            if self.execute_shell([_file]) != 0:
-                self.log.info("updates are available")
-                do_update = True
-            self.log.info("running: {0} done".format(_file))
-        if do_update:
-            self.log.debug("setting task to lock_get")
-            self.task = "lock_get"
-        else:
-            self.log.info("no updates available")
-            sys.exit(0)
+    def check_rbt(self):
+        if self._rbt:
+            if self.task != 'post_update':
+                self.log.info("reboot was not triggered by foreman_dlm_updater, exiting")
+                sys.exit(0)
+            else:
+                self.log.info("reboot was triggered by foreman_dlm_updater, picking up remaining tasks")
 
     def lock_get(self):
         self.foreman_lock.acquire()
@@ -202,68 +204,88 @@ class ForemanDlmUpdater(object):
         del self.task
         sys.exit(0)
 
-    def do_update(self):
-        self.log.info("running_update scripts")
-        _path = self.config.get('main', 'update.d')
-        files = [f for f in os.listdir(_path) if os.path.isfile(os.path.join(_path, f))]
-        for _file in files:
+    def get_scripts(self, path):
+        _path = self.config.get('main', path)
+        files = list()
+        for _file in os.listdir(_path):
             _file = os.path.join(_path, _file)
-            if not os.access(_file, os.X_OK):
+            self.log.debug("found the file: {0}".format(_file))
+            if not os.path.isfile(_file):
                 continue
+            if not os.stat(_file).st_uid == 0:
+                self.log.warning("file not owned by root")
+                continue
+            if os.stat(_file).st_mode & stat.S_IXUSR != 64:
+                self.log.warning("file not executable by root")
+                continue
+            if os.stat(_file).st_mode & stat.S_IWOTH == 2:
+                self.log.warning("file group writeable")
+                continue
+            if os.stat(_file).st_mode & stat.S_IWGRP == 16:
+                self.log.warning("file world writeable")
+                continue
+            files.append(_file)
+        return files
+
+    def needs_update(self):
+        update = False
+        self.log.info("checking if updates are available")
+        files = self.get_scripts('needs_update.d')
+        for _file in files:
+            self.log.info("running: {0}".format(_file))
+            if self.execute_shell([_file]) != 0:
+                self.log.info("updates are available")
+                update = True
+            self.log.info("running: {0} done".format(_file))
+        if update:
+            self.task = "lock_get"
+        else:
+            self.log.info("no updates available")
+            sys.exit(0)
+
+    def update(self):
+        self.log.info("running_update scripts")
+        files = self.get_scripts('update.d')
+        for _file in files:
             self.log.info("running: {0}".format(_file))
             if self.execute_shell([_file]) != 0:
                 self.log.info("script failed, stopping, keeping lock")
                 sys.exit(1)
             self.log.info("running: {0} done".format(_file))
-        self.log.info("setting task to needs_reboot")
         self.task = "needs_reboot"
 
     def post_update(self):
         self.log.info("running post_update scripts")
-        _path = self.config.get('main', 'post_update.d')
-        files = [f for f in os.listdir(_path) if os.path.isfile(os.path.join(_path, f))]
+        files = self.get_scripts('post_update.d')
         for _file in files:
-            _file = os.path.join(_path, _file)
-            if not os.access(_file, os.X_OK):
-                continue
             self.log.info("running: {0}".format(_file))
             if self.execute_shell([_file]) != 0:
                 self.log.info("script failed, stopping, keeping lock")
                 sys.exit(1)
             self.log.info("running: {0} done".format(_file))
-        self.log.info("setting task to lock_release")
         self.task = "lock_release"
 
     def pre_update(self):
         self.log.info("running pre_update scripts")
-        _path = self.config.get('main', 'pre_update.d')
-        files = [f for f in os.listdir(_path) if os.path.isfile(os.path.join(_path, f))]
+        files = self.get_scripts('pre_update.d')
         for _file in files:
-            _file = os.path.join(_path, _file)
-            if not os.access(_file, os.X_OK):
-                continue
             self.log.info("running: {0}".format(_file))
             if self.execute_shell([_file]) != 0:
                 self.log.info("script failed, stopping, keeping lock")
                 sys.exit(1)
             self.log.info("running: {0} done".format(_file))
-        self.log.info("setting task to do_update")
-        self.task = "do_update"
+        self.task = "update"
 
     def reboot(self):
-        self.log.info("rebooting, and setting task to post_update")
+        self.log.info("rebooting")
         self.task = "post_update"
         sys.exit(self.execute_shell([self.config.get('main', 'reboot_cmd')]))
 
     def needs_reboot(self):
-        reboot = True
-        _path = self.config.get('main', 'needs_reboot.d')
         self.log.info("running needs reboot scripts")
-        files = [f for f in os.listdir(_path) if os.path.isfile(os.path.join(_path, f))]
+        reboot = True
+        files = self.get_scripts('needs_reboot.d')
         for _file in files:
-            _file = os.path.join(_path, _file)
-            if not os.access(_file, os.X_OK):
-                continue
             self.log.info("running: {0}".format(_file))
             if self.execute_shell([_file]) != 0:
                 self.log.info("running: {0} done".format(_file))
@@ -273,43 +295,41 @@ class ForemanDlmUpdater(object):
                 reboot = False
             self.log.info("running: {0} done".format(_file))
         if reboot:
-            self.log.info("setting task to reboot")
             self.task = "reboot"
         else:
-            self.log.info("setting task to post_update")
             self.task = "post_update"
 
     def work(self):
         self.lock.acquire()
+        self.check_rbt()
         while True:
             task = self.task
             if task not in [
-                "check_update",
+                "needs_update",
                 "lock_get",
                 "pre_update",
-                "do_update",
+                "update",
                 "needs_reboot",
                 "reboot",
                 "post_update",
                 "lock_release"
             ]:
-                self.log.fatal("found garbage in status file")
+                self.log.fatal("found garbage in status file: {0}".format(self.task))
+                del self.task
                 sys.exit(1)
-            if task == "check_update":
-                self.check_update()
+            if task == "needs_update":
+                self.needs_update()
             elif task == "lock_get":
                 self.lock_get()
             elif task == "lock_release":
                 self.lock_release()
             elif task == "pre_update":
                 self.pre_update()
-            elif task == "do_update":
-                self.do_update()
+            elif task == "update":
+                self.update()
             elif task == "needs_reboot":
                 self.needs_reboot()
             elif task == "reboot":
                 self.reboot()
             elif task == "post_update":
                 self.post_update()
-            else:
-                break

@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='foreman-dlm-updater',
-    version='0.0.1',
+    version='0.0.2',
     description='ForemanDlmUpdater, Linux client counterpart to the awesome Foreman DLM plugin.',
     long_description="""
 foreman-dlm-updater is a helper script that allows to do graceful, rolling updates on clustered Linux systems.
